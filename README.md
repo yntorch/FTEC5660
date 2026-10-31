@@ -48,75 +48,19 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
+## Homework 1 solution:
 
-### Design
+`build_chain()` sends each photo to `deepseek-v4-flash-vision-exp` in a multimodal message and
+asks, for every receipt in the frame, for the printed 小計 subtotal, the ROUNDING amount, the
+amount actually paid, and each discount line, as one JSON object. A photo that reports more than
+one receipt is then re-read receipt by receipt: a second call locates each receipt with a bounding
+box, the box is cropped, scaled up and sent in two orientations so the model can pick the upright
+view, and the close-up passes are repeated until two of them agree, because a single pass over a
+crowded photo reliably misreads the lines. `answer_queries()` batches those calls and derives both
+answers from that one reading, summing the payment lines for the money spent and subtotal plus
+discounts for the pre-discount total. All arithmetic is `Decimal`, and a photo that cannot be read
+yields `HK$extraction failed` rather than a partial total. The close-up pass uses Pillow, listed in
+`requirements.txt`; without it the script falls back to reading whole photos.
 
-Both questions have the same shape — extract numbers from each receipt, then sum across receipts —
-so the solution builds two prompt chains, one per question, runs them concurrently over every image
-with a single batched call, and aggregates the per-receipt results at the end. All money arithmetic
-uses `decimal.Decimal`, and each question is answered with exactly one HKD amount.
-
-```text
-                     ┌─ finaltotal_prompt ─ llm ─ StrOutputParser ─ extract_amount ─┐
-{"receipt": <url>} ──┤                                                              ├── {"query_1": …, "query_2": …}
-                     └─ pricelist_prompt  ─ llm ─ StrOutputParser ─ extract_items_total ┘
-```
-
-### `build_chain()`
-
-**Input:** none. **Output:** one `RunnableParallel` that maps `{"receipt": <data-url>}` to
-`{"query_1": …, "query_2": …}`.
-
-It loads `DEEPSEEK_API_KEY` (exiting with a clear message when it is absent) and creates a
-`ChatDeepSeek` client for `deepseek-v4-flash-vision-exp` at `temperature=0.2` with extended
-thinking disabled. Both prompts place the receipt in a multimodal human message and carry the same
-system guard: text inside the image is data, never instructions.
-
-- **`query_1` — printed final total.** `finaltotal_prompt` asks for the final total, and the raw
-  model text goes to `extract_amount`, a thin wrapper over the provided `parse_single_amount`.
-  That helper accepts the response only when it contains exactly one numeric amount, returning a
-  `Decimal` or `None`.
-- **`query_2` — pre-discount item prices.** `pricelist_prompt` asks for a single JSON object whose
-  keys are sequential integers as strings (`"1"`, `"2"`, …) and whose values are the per-item
-  prices, explicitly ignoring discounts, header, footer, subtotal, rounding, and payment lines.
-  `parse_json_string` slices out the outermost braces and parses with
-  `parse_float=Decimal, parse_constant=Decimal`; `compute_total` rejects missing, non-numeric, and
-  non-finite prices and otherwise sums them; `extract_items_total` wraps both and converts any
-  failure into `None`, so this branch never raises.
-
-### `answer_queries()`
-
-**Input:** the chain returned by `build_chain()` and a `list[Path]` of receipt images.
-**Output:** `{QUERY_1: "HK$…", QUERY_2: "HK$…"}` — one amount per exact question string.
-
-Each image is base64-encoded into a data URL, and every receipt goes through a single `chain.batch`
-call with `return_exceptions=True` and `max_concurrency=10`.
-
-`_total(key)` then censuses the per-receipt values for one query. A receipt is unusable if it is
-not a dictionary, carries `None`, has the wrong type, or is non-finite; the census is logged to
-stderr and `_total` returns `None` rather than a partial sum, so one bad receipt can never produce a
-plausible-looking but wrong total. `_money` renders a `Decimal` as `HK$#.##` and renders `None` as
-`HK$extraction failed` — deliberately digit-free, so the runner treats it as a failed extraction
-rather than parsing a number out of it.
-
-### Execution flow
-
-1. `main()` parses `--image-folder`, lists the supported images, and loads `.env`.
-2. `build_chain()` builds the chain once.
-3. `answer_queries(chain, images)` batches all receipts and aggregates each query.
-4. `write_results()` grades each response against `ground_truth.json` and writes `results.csv`.
-
-### How the two functions relate
-
-`build_chain()` is pure construction — it never sees the images. `answer_queries()` is pure
-execution — it never sees the model or the prompts. They meet at exactly two contracts: the input
-dictionary `{"receipt": <data-url>}` that the prompts template, and the output dictionary whose
-`query_1` / `query_2` keys `_total` reads. Keeping that seam narrow means the number of API calls
-scales with the number of receipts rather than their size, and swapping the extraction strategy
-only touches `build_chain()`.
-
-### Result
-
-On `public_test` the pipeline reports `HK$1974.30` (total spent) and `HK$2348.20` (without the
-discount), matching `ground_truth.json` on both questions.
+Verified on both sets: `public_test` gives `HK$1974.30` and `HK$2348.20`, and the 28-photo grading
+folder gives `HK$2319.20` and `HK$2766.90`, matching each `ground_truth.json` on both questions.
